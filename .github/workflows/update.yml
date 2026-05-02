@@ -183,7 +183,7 @@ jobs:
             ssh -i "${HOME}/.ssh/aur" -o IdentitiesOnly=yes -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o HostKeyAlias=aur.archlinux.org aur@aur.archlinux.org help >/dev/null
           fi
 
-          package_files=(.nvchecker.toml PKGBUILD .SRCINFO update-version.sh)
+          package_files=(.nvchecker.toml PKGBUILD .SRCINFO)
 
           git -c init.defaultBranch=master clone "$aur_url" "$aur_dir"
           cp "${package_files[@]}" "$aur_dir/"
