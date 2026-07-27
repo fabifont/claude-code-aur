@@ -147,12 +147,15 @@ jobs:
           PKGVER: ${{ steps.update.outputs.pkgver }}
           VERSION_CHANGED: ${{ steps.version.outputs.version_changed }}
         run: |
+          # Off the default branch the step still runs end to end and stops at the
+          # push, so a branch exercises every decision it would make on main.
+          dry_run=false
           if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
-            echo "Skipping AUR publish from ${GITHUB_REF_NAME}; only ${DEFAULT_BRANCH} publishes."
-            exit 0
+            dry_run=true
+            echo "::notice::${GITHUB_REF_NAME} is not ${DEFAULT_BRANCH}; running as a dry run."
           fi
 
-          if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
+          if [[ -z "${AUR_SSH_PRIVATE_KEY}" && "$dry_run" == false ]]; then
             echo "::error::AUR_SSH_PRIVATE_KEY secret is required to publish to AUR."
             exit 1
           fi
@@ -190,6 +193,28 @@ jobs:
             fi
           fi
 
+          if [[ -z "${PKGVER}" ]]; then
+            PKGVER="$(awk -F= '/^pkgver=/{print $2}' PKGBUILD)"
+          fi
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            commit_message="Sync ${AUR_PKGBASE} packaging"
+          else
+            commit_message="Update ${AUR_PKGBASE} to ${PKGVER}"
+          fi
+
+          git -C "$aur_dir" commit -m "$commit_message"
+          git -C "$aur_dir" remote set-url --push origin "ssh://aur@aur.archlinux.org/${AUR_PKGBASE}.git"
+
+          if [[ "$dry_run" == true ]]; then
+            echo "::group::Commit that would be pushed"
+            git -C "$aur_dir" show
+            echo "::endgroup::"
+            echo "git -C ${aur_dir} push origin HEAD:master (DRY-RUN)"
+            echo "::notice::Dry run from ${GITHUB_REF_NAME}: nothing was pushed to AUR."
+            exit 0
+          fi
+
           install -dm700 ~/.ssh
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
@@ -217,19 +242,6 @@ jobs:
           else
             export GIT_SSH_COMMAND="ssh -i ${HOME}/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=${HOME}/.ssh/known_hosts -o StrictHostKeyChecking=yes -o HostKeyAlias=aur.archlinux.org"
           fi
-
-          if [[ -z "${PKGVER}" ]]; then
-            PKGVER="$(awk -F= '/^pkgver=/{print $2}' PKGBUILD)"
-          fi
-
-          if [[ "${EVENT_NAME}" == "push" ]]; then
-            commit_message="Sync ${AUR_PKGBASE} packaging"
-          else
-            commit_message="Update ${AUR_PKGBASE} to ${PKGVER}"
-          fi
-
-          git -C "$aur_dir" commit -m "$commit_message"
-          git -C "$aur_dir" remote set-url --push origin "ssh://aur@aur.archlinux.org/${AUR_PKGBASE}.git"
 
           attempts=3
           for (( attempt = 1; attempt <= attempts; attempt++ )); do
