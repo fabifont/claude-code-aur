@@ -139,15 +139,55 @@ jobs:
         run: git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Publish to AUR
-        if: github.event_name == 'push' || steps.version.outputs.version_changed == 'true'
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           AUR_SSH_PASSPHRASE: ${{ secrets.AUR_SSH_PASSPHRASE }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
           PKGVER: ${{ steps.update.outputs.pkgver }}
+          VERSION_CHANGED: ${{ steps.version.outputs.version_changed }}
         run: |
+          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "Skipping AUR publish from ${GITHUB_REF_NAME}; only ${DEFAULT_BRANCH} publishes."
+            exit 0
+          fi
+
           if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
             echo "::error::AUR_SSH_PRIVATE_KEY secret is required to publish to AUR."
             exit 1
+          fi
+
+          bot_email="41898282+github-actions[bot]@users.noreply.github.com"
+          package_files=(.nvchecker.toml PKGBUILD .SRCINFO)
+          aur_dir="$(mktemp -d)"
+
+          # Read over HTTPS so runs with nothing to publish open no SSH session at all.
+          git -c init.defaultBranch=master clone "https://aur.archlinux.org/${AUR_PKGBASE}.git" "$aur_dir"
+          cp "${package_files[@]}" "$aur_dir/"
+
+          git -C "$aur_dir" config user.name "github-actions[bot]"
+          git -C "$aur_dir" config user.email "$bot_email"
+          git -C "$aur_dir" add "${package_files[@]}"
+
+          if git -C "$aur_dir" diff --cached --quiet; then
+            echo "AUR repository is already up to date."
+            exit 0
+          fi
+
+          # Repairing divergence is only safe while the AUR tip is our own commit: the
+          # only way it can differ from this repo is a publish of ours that failed. A
+          # tip from anyone else means a maintainer patched AUR directly, and silently
+          # reverting that is not this workflow's call. Deliberate publishes, a version
+          # bump or a packaging push, still go through as before.
+          if [[ "${VERSION_CHANGED}" != "true" && "${EVENT_NAME}" != "push" ]]; then
+            aur_tip="$(git -C "$aur_dir" log -1 --format='%h')"
+            aur_tip_author="$(git -C "$aur_dir" log -1 --format='%ae')"
+            aur_tip_committer="$(git -C "$aur_dir" log -1 --format='%ce')"
+
+            if [[ "$aur_tip_author" != "$bot_email" || "$aur_tip_committer" != "$bot_email" ]]; then
+              echo "::warning::AUR tip ${aur_tip} is from ${aur_tip_author}, not this workflow. Leaving it in place; reconcile it into this repository."
+              exit 0
+            fi
           fi
 
           install -dm700 ~/.ssh
@@ -163,9 +203,6 @@ jobs:
           } > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
-          aur_url="ssh://aur@aur.archlinux.org/${AUR_PKGBASE}.git"
-          aur_dir="$(mktemp -d)"
-
           if [[ -n "${AUR_SSH_PASSPHRASE}" ]]; then
             eval "$(ssh-agent -s)"
             trap 'ssh-agent -k >/dev/null' EXIT
@@ -177,35 +214,35 @@ jobs:
             chmod 700 "$askpass"
             DISPLAY=:0 SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force ssh-add "${HOME}/.ssh/aur" </dev/null
             export GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=${HOME}/.ssh/known_hosts -o StrictHostKeyChecking=yes -o HostKeyAlias=aur.archlinux.org"
-            ssh -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o HostKeyAlias=aur.archlinux.org aur@aur.archlinux.org help >/dev/null
           else
             export GIT_SSH_COMMAND="ssh -i ${HOME}/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=${HOME}/.ssh/known_hosts -o StrictHostKeyChecking=yes -o HostKeyAlias=aur.archlinux.org"
-            ssh -i "${HOME}/.ssh/aur" -o IdentitiesOnly=yes -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" -o StrictHostKeyChecking=yes -o HostKeyAlias=aur.archlinux.org aur@aur.archlinux.org help >/dev/null
-          fi
-
-          package_files=(.nvchecker.toml PKGBUILD .SRCINFO)
-
-          git -c init.defaultBranch=master clone "$aur_url" "$aur_dir"
-          cp "${package_files[@]}" "$aur_dir/"
-
-          git -C "$aur_dir" config user.name "github-actions[bot]"
-          git -C "$aur_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C "$aur_dir" add "${package_files[@]}"
-
-          if git -C "$aur_dir" diff --cached --quiet; then
-            echo "AUR repository is already up to date."
-            exit 0
           fi
 
           if [[ -z "${PKGVER}" ]]; then
             PKGVER="$(awk -F= '/^pkgver=/{print $2}' PKGBUILD)"
           fi
 
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${EVENT_NAME}" == "push" ]]; then
             commit_message="Sync ${AUR_PKGBASE} packaging"
           else
             commit_message="Update ${AUR_PKGBASE} to ${PKGVER}"
           fi
 
           git -C "$aur_dir" commit -m "$commit_message"
-          git -C "$aur_dir" push origin HEAD:master
+          git -C "$aur_dir" remote set-url --push origin "ssh://aur@aur.archlinux.org/${AUR_PKGBASE}.git"
+
+          attempts=3
+          for (( attempt = 1; attempt <= attempts; attempt++ )); do
+            if git -C "$aur_dir" push origin HEAD:master; then
+              exit 0
+            fi
+
+            if (( attempt < attempts )); then
+              delay=$(( attempt * 15 ))
+              echo "::warning::Push to AUR failed (attempt ${attempt}/${attempts}); retrying in ${delay}s."
+              sleep "$delay"
+            fi
+          done
+
+          echo "::error::Push to AUR failed after ${attempts} attempts."
+          exit 1
